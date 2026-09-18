@@ -1,0 +1,20 @@
+# Zerodha Kite API Configuration
+# ================================
+#
+# Get your API credentials from: https://developers.kite.trade/
+#
+# WARNING: Do NOT commit this file with real credentials to version control!
+#
+
+# API Key (from Kite Connect app)
+api.key=your_api_key_here
+
+# API Secret (from Kite Connect app)
+api.secret=your_api_secret_here
+
+# Access Token (generated after login, auto-filled by app)
+access.token=
+
+# User ID (auto-filled after login)
+user.id=
+
