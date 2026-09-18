@@ -3,8 +3,6 @@ package org.example.news;
 import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.text.PDFTextStripper;
-import org.example.collector.GeminiAnalyzer;
-import org.example.collector.LocalAiAnalyzer;
 import org.example.collector.PythonAiAnalyzer;
 import org.example.model.StockEvent;
 
