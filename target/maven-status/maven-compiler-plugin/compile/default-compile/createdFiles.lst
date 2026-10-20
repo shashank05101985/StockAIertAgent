@@ -1,3 +1,4 @@
+org/example/collector/NseCorporateActionImporter.class
 org/example/news/SentimentAnalyzer$SentimentResult.class
 org/example/analysis/StockFeatureCalculator$SupportResistance.class
 org/example/BuySellRatio.class
@@ -31,6 +32,7 @@ org/example/model/StockSignal$SignalType.class
 org/example/model/IntradaySignal$SignalType.class
 org/example/collector/StockEventCollector.class
 org/example/model/StockEvent.class
+org/example/model/CorporateAction.class
 org/example/news/EventClassifier.class
 org/example/zerodha/ZerodhaTickerService$CandleBuilder.class
 org/example/news/NewsArticle.class
@@ -40,6 +42,7 @@ org/example/reader/IntradayDataReader.class
 org/example/news/NewsSource.class
 org/example/NsePriceBandLoader.class
 org/example/news/SentimentAnalyzer.class
+org/example/analysis/SplitAdjustedSeries.class
 org/example/Main.class
 org/example/BuySellRatio$BuySellSnapshot.class
 org/example/model/PriceBand.class
@@ -51,11 +54,14 @@ org/example/reader/BhavCopyReader.class
 org/example/BuySellRatio$1.class
 org/example/zerodha/ZerodhaTickerService$TickData.class
 org/example/repository/PotentialStockRepoistory.class
+org/example/repository/CorporateActionRepository.class
+org/example/collector/NseCorporateActionFetcher.class
 org/example/model/IndicatorResult.class
 org/example/IntradayTradingMain$1.class
 org/example/zerodha/ZerodhaTickerService$1.class
 org/example/zerodha/ZerodhaLiveTrading.class
 org/example/StockFeatureMain.class
+org/example/collector/PriceBasedCorporateActions.class
 org/example/model/PotentialStock.class
 org/example/model/StockSignal.class
 org/example/model/StockData.class

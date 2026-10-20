@@ -14,7 +14,46 @@ public class StockFeatureRepository {
         this.connection = connection;
     }
 
-    public void upsert(StockDailyFeature f) throws SQLException {
+    /**
+     * Dates (per symbol) that exist in stock_data from fromDate onward
+     * but have no row in stock_daily_features yet.
+     */
+    public Map<String, Set<java.time.LocalDate>> findMissingDates(java.time.LocalDate fromDate) throws SQLException {
+
+        String sql = """
+            SELECT s.symbol, s.date
+            FROM stock_data s
+            LEFT JOIN stock_daily_features f
+                   ON f.symbol = s.symbol
+                  AND f.trade_date = s.date
+            WHERE s.date >= ?
+              AND f.symbol IS NULL
+            """;
+
+        Map<String, Set<java.time.LocalDate>> missing = new HashMap<>();
+
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+
+            ps.setDate(1, Date.valueOf(fromDate));
+
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    missing.computeIfAbsent(rs.getString(1), k -> new TreeSet<>())
+                        .add(rs.getDate(2).toLocalDate());
+                }
+            }
+        }
+
+        // Plain SELECT opened a transaction (autocommit is off); end it.
+        connection.commit();
+
+        return missing;
+    }
+
+    /** Built once: the SQL never changes. */
+    private static final String UPSERT_SQL = buildUpsertSql();
+
+    private static String buildUpsertSql() {
 
         String placeholders = String.join(",", Collections.nCopies(120, "?"));
 
@@ -424,383 +463,37 @@ public class StockFeatureRepository {
                 distance_to_support = EXCLUDED.distance_to_support
             """.formatted(placeholders);
 
+        return sql;
+    }
+
+    public void upsert(StockDailyFeature f) throws SQLException {
+        upsertBatch(List.of(f));
+    }
+
+    /**
+     * Writes many feature rows in one JDBC batch and one commit.
+     * Much faster than one commit per row when backfilling history.
+     */
+    public void upsertBatch(List<StockDailyFeature> features) throws SQLException {
+
+        if (features.isEmpty()) {
+            return;
+        }
 
         boolean autoCommit = connection.getAutoCommit();
 
         connection.setAutoCommit(false);
 
-
-        try (PreparedStatement ps = connection.prepareStatement(sql)) {
-
-            int i = 1;
-
-
-            // =====================================================
-            // RAW DATA
-            // =====================================================
-
-            ps.setString(i++, f.symbol);
-
-            ps.setDate(i++, Date.valueOf(f.tradeDate));
-
-            ps.setDouble(i++, f.open);
-            ps.setDouble(i++, f.high);
-            ps.setDouble(i++, f.low);
-            ps.setDouble(i++, f.close);
-            ps.setLong(i++, f.volume);
-
-
-            // =====================================================
-            // DELIVERY
-            // =====================================================
-
-            setDouble(ps, i++, f.deliveryPercent);
-
-            setDouble(ps, i++, f.avgDeliveryPercent5);
-
-            setDouble(ps, i++, f.deliveryChange);
-
-            setBoolean(ps, i++, f.deliveryConfirmation);
-
-
-            // =====================================================
-            // RETURNS
-            // =====================================================
-
-            setDouble(ps, i++, f.return1d);
-            setDouble(ps, i++, f.return3d);
-            setDouble(ps, i++, f.return5d);
-            setDouble(ps, i++, f.return10d);
-            setDouble(ps, i++, f.return20d);
-
-
-            // =====================================================
-            // SMA
-            // =====================================================
-
-            setDouble(ps, i++, f.sma20);
-            setDouble(ps, i++, f.sma50);
-            setDouble(ps, i++, f.sma100);
-            setDouble(ps, i++, f.sma200);
-
-
-            // =====================================================
-            // EMA
-            // =====================================================
-
-            setDouble(ps, i++, f.ema9);
-            setDouble(ps, i++, f.ema20);
-            setDouble(ps, i++, f.ema50);
-            setDouble(ps, i++, f.ema100);
-            setDouble(ps, i++, f.ema200);
-
-
-            // =====================================================
-            // TREND FLAGS
-            // =====================================================
-
-            setBoolean(ps, i++, f.closeAboveEma20);
-
-            setBoolean(ps, i++, f.ema20AboveEma50);
-
-            setBoolean(ps, i++, f.ema50AboveEma200);
-
-
-            // =====================================================
-            // RSI
-            // =====================================================
-
-            setDouble(ps, i++, f.rsi14);
-
-
-            // =====================================================
-            // MACD
-            // =====================================================
-
-            setDouble(ps, i++, f.macd);
-            setDouble(ps, i++, f.macdSignal);
-            setDouble(ps, i++, f.macdHistogram);
-
-
-            // =====================================================
-            // ATR / ADX
-            // =====================================================
-
-            setDouble(ps, i++, f.tr14);
-            setDouble(ps, i++, f.atr14);
-            setDouble(ps, i++, f.atrPercent);
-
-            setDouble(ps, i++, f.plusDm14);
-            setDouble(ps, i++, f.minusDm14);
-            setDouble(ps, i++, f.plusDi14);
-            setDouble(ps, i++, f.minusDi14);
-            setDouble(ps, i++, f.adx14);
-
-
-            // =====================================================
-            // STOCHASTIC
-            // =====================================================
-
-            setDouble(ps, i++, f.stochasticK);
-            setDouble(ps, i++, f.stochasticD);
-
-
-            // =====================================================
-            // CCI
-            // =====================================================
-
-            setDouble(ps, i++, f.cci20);
-
-
-            // =====================================================
-            // ROC
-            // =====================================================
-
-            setDouble(ps, i++, f.roc5);
-            setDouble(ps, i++, f.roc10);
-            setDouble(ps, i++, f.roc20);
-
-
-            // =====================================================
-            // BOLLINGER
-            // =====================================================
-
-            setDouble(ps, i++, f.bbMiddle);
-            setDouble(ps, i++, f.bbUpper);
-            setDouble(ps, i++, f.bbLower);
-            setDouble(ps, i++, f.bbWidth);
-            setDouble(ps, i++, f.bbPercentB);
-
-
-            // =====================================================
-            // VOLUME
-            // =====================================================
-
-            setDouble(ps, i++, f.avgVolume5);
-            setDouble(ps, i++, f.avgVolume10);
-            setDouble(ps, i++, f.avgVolume20);
-            setDouble(ps, i++, f.avgVolume50);
-
-            setDouble(ps, i++, f.volumeRatio5);
-            setDouble(ps, i++, f.volumeRatio20);
-            setDouble(ps, i++, f.volumeRatio50);
-
-            setDouble(ps, i++, f.obv);
-
-
-            // =====================================================
-            // HIGHS
-            // =====================================================
-
-            setDouble(ps, i++, f.high5d);
-            setDouble(ps, i++, f.high10d);
-            setDouble(ps, i++, f.high20d);
-            setDouble(ps, i++, f.high50d);
-
-
-            // =====================================================
-            // LOWS
-            // =====================================================
-
-            setDouble(ps, i++, f.low5d);
-            setDouble(ps, i++, f.low10d);
-            setDouble(ps, i++, f.low20d);
-            setDouble(ps, i++, f.low50d);
-
-
-            // =====================================================
-            // DISTANCE FROM HIGH
-            // =====================================================
-
-            setDouble(ps, i++, f.distanceFrom5dHigh);
-
-            setDouble(ps, i++, f.distanceFrom10dHigh);
-
-            setDouble(ps, i++, f.distanceFrom20dHigh);
-
-            setDouble(ps, i++, f.distanceFrom52wHigh);
-
-
-            // =====================================================
-            // PULLBACK / RECOVERY
-            // =====================================================
-
-            setDouble(ps, i++, f.previous5dHigh);
-
-            setDouble(ps, i++, f.previous5dLow);
-
-            setDouble(ps, i++, f.distanceToPrevious5dHigh);
-
-            setDouble(ps, i++, f.pullbackDepth5d);
-
-            setDouble(ps, i++, f.distanceFromPullbackLow);
-
-            if (f.pullbackDays5d == null) {
-
-                ps.setNull(i++, Types.INTEGER);
-
-            } else {
-
-                ps.setInt(i++, f.pullbackDays5d);
+        try (PreparedStatement ps = connection.prepareStatement(UPSERT_SQL)) {
+
+            for (StockDailyFeature f : features) {
+                bind(ps, f);
+                ps.addBatch();
             }
 
-            setDouble(ps, i++, f.recoveryFromPullback);
-
-            setDouble(ps, i++, f.recoveryVolumeRatio);
-
-            setBoolean(ps, i++, f.pullbackDetected);
-
-            setBoolean(ps, i++, f.recoveryDetected);
-
-
-            // =====================================================
-            // RANGE / VOLATILITY
-            // =====================================================
-
-            setDouble(ps, i++, f.dailyRangePercent);
-
-            setDouble(ps, i++, f.avgRange5Percent);
-
-            setDouble(ps, i++, f.avgRange20Percent);
-
-            setDouble(ps, i++, f.volatility5);
-
-            setDouble(ps, i++, f.volatility20);
-
-
-            // =====================================================
-            // PRICE STRUCTURE
-            // =====================================================
-
-            setBoolean(ps, i++, f.higherHigh);
-
-            setBoolean(ps, i++, f.higherLow);
-
-            setBoolean(ps, i++, f.lowerHigh);
-
-            setBoolean(ps, i++, f.lowerLow);
-
-
-            // =====================================================
-            // BREAKOUT
-            // =====================================================
-
-            setBoolean(ps, i++, f.breakout5d);
-
-            setBoolean(ps, i++, f.breakout10d);
-
-            setBoolean(ps, i++, f.breakout20d);
-
-
-            // =====================================================
-            // BREAKDOWN
-            // =====================================================
-
-            setBoolean(ps, i++, f.breakdown5d);
-
-            setBoolean(ps, i++, f.breakdown10d);
-
-            setBoolean(ps, i++, f.breakdown20d);
-
-
-            // =====================================================
-            // CONSOLIDATION
-            // =====================================================
-
-            setDouble(ps, i++, f.consolidationWidth);
-
-            setDouble(ps, i++, f.consolidationScore);
-
-            setDouble(ps, i++, f.breakoutStrength);
-
-
-            // =====================================================
-            // NIFTY
-            // =====================================================
-
-            setDouble(ps, i++, f.niftyReturn5d);
-
-            setDouble(ps, i++, f.niftyReturn10d);
-
-            setDouble(ps, i++, f.niftyReturn20d);
-
-
-            // =====================================================
-            // RELATIVE STRENGTH
-            // =====================================================
-
-            setDouble(ps, i++, f.relativeStrength5d);
-
-            setDouble(ps, i++, f.relativeStrength10d);
-
-            setDouble(ps, i++, f.relativeStrength20d);
-
-
-            // =====================================================
-            // SCORES
-            // =====================================================
-
-            setDouble(ps, i++, f.trendScore);
-
-            setDouble(ps, i++, f.momentumScore);
-
-            setDouble(ps, i++, f.volumeScore);
-
-            setDouble(ps, i++, f.volatilityScore);
-
-            setDouble(ps, i++, f.relativeStrengthScore);
-
-            setDouble(ps, i++, f.priceStructureScore);
-
-            setDouble(ps, i++, f.breakoutScore);
-
-
-            // =====================================================
-            // FINAL SCORE
-            // =====================================================
-
-            setDouble(ps, i++, f.bullishScore);
-
-
-            // =====================================================
-            // MARKET BIAS
-            // =====================================================
-
-            if (f.marketBias == null) {
-
-                ps.setNull(i++, Types.VARCHAR);
-
-            } else {
-
-                ps.setString(i++, f.marketBias);
-            }
-
-            setDouble(ps,i++,f.resistancePrice);
-            setDouble(ps,i++,f.supportPrice);
-            setDouble(ps,i++,f.resistanceStrength);
-            setDouble(ps,i++,f.supportStrength);
-            setDouble(ps,i++,f.distanceToResistance);
-            setDouble(ps,i++,f.distanceToSupport);
-
-
-            // =====================================================
-            // VALIDATE PARAMETER COUNT
-            // =====================================================
-
-            if (i != 121) {
-
-                throw new IllegalStateException("Expected 120 parameters, but assigned " + (i - 1));
-            }
-
-
-            // =====================================================
-            // EXECUTE
-            // =====================================================
-
-            ps.executeUpdate();
+            ps.executeBatch();
 
             connection.commit();
-
 
         } catch (Exception ex) {
 
@@ -811,6 +504,369 @@ public class StockFeatureRepository {
         } finally {
 
             connection.setAutoCommit(autoCommit);
+        }
+    }
+
+    private static void bind(PreparedStatement ps, StockDailyFeature f) throws SQLException {
+
+        int i = 1;
+
+
+        // =====================================================
+        // RAW DATA
+        // =====================================================
+
+        ps.setString(i++, f.symbol);
+
+        ps.setDate(i++, Date.valueOf(f.tradeDate));
+
+        ps.setDouble(i++, f.open);
+        ps.setDouble(i++, f.high);
+        ps.setDouble(i++, f.low);
+        ps.setDouble(i++, f.close);
+        ps.setLong(i++, f.volume);
+
+
+        // =====================================================
+        // DELIVERY
+        // =====================================================
+
+        setDouble(ps, i++, f.deliveryPercent);
+
+        setDouble(ps, i++, f.avgDeliveryPercent5);
+
+        setDouble(ps, i++, f.deliveryChange);
+
+        setBoolean(ps, i++, f.deliveryConfirmation);
+
+
+        // =====================================================
+        // RETURNS
+        // =====================================================
+
+        setDouble(ps, i++, f.return1d);
+        setDouble(ps, i++, f.return3d);
+        setDouble(ps, i++, f.return5d);
+        setDouble(ps, i++, f.return10d);
+        setDouble(ps, i++, f.return20d);
+
+
+        // =====================================================
+        // SMA
+        // =====================================================
+
+        setDouble(ps, i++, f.sma20);
+        setDouble(ps, i++, f.sma50);
+        setDouble(ps, i++, f.sma100);
+        setDouble(ps, i++, f.sma200);
+
+
+        // =====================================================
+        // EMA
+        // =====================================================
+
+        setDouble(ps, i++, f.ema9);
+        setDouble(ps, i++, f.ema20);
+        setDouble(ps, i++, f.ema50);
+        setDouble(ps, i++, f.ema100);
+        setDouble(ps, i++, f.ema200);
+
+
+        // =====================================================
+        // TREND FLAGS
+        // =====================================================
+
+        setBoolean(ps, i++, f.closeAboveEma20);
+
+        setBoolean(ps, i++, f.ema20AboveEma50);
+
+        setBoolean(ps, i++, f.ema50AboveEma200);
+
+
+        // =====================================================
+        // RSI
+        // =====================================================
+
+        setDouble(ps, i++, f.rsi14);
+
+
+        // =====================================================
+        // MACD
+        // =====================================================
+
+        setDouble(ps, i++, f.macd);
+        setDouble(ps, i++, f.macdSignal);
+        setDouble(ps, i++, f.macdHistogram);
+
+
+        // =====================================================
+        // ATR / ADX
+        // =====================================================
+
+        setDouble(ps, i++, f.tr14);
+        setDouble(ps, i++, f.atr14);
+        setDouble(ps, i++, f.atrPercent);
+
+        setDouble(ps, i++, f.plusDm14);
+        setDouble(ps, i++, f.minusDm14);
+        setDouble(ps, i++, f.plusDi14);
+        setDouble(ps, i++, f.minusDi14);
+        setDouble(ps, i++, f.adx14);
+
+
+        // =====================================================
+        // STOCHASTIC
+        // =====================================================
+
+        setDouble(ps, i++, f.stochasticK);
+        setDouble(ps, i++, f.stochasticD);
+
+
+        // =====================================================
+        // CCI
+        // =====================================================
+
+        setDouble(ps, i++, f.cci20);
+
+
+        // =====================================================
+        // ROC
+        // =====================================================
+
+        setDouble(ps, i++, f.roc5);
+        setDouble(ps, i++, f.roc10);
+        setDouble(ps, i++, f.roc20);
+
+
+        // =====================================================
+        // BOLLINGER
+        // =====================================================
+
+        setDouble(ps, i++, f.bbMiddle);
+        setDouble(ps, i++, f.bbUpper);
+        setDouble(ps, i++, f.bbLower);
+        setDouble(ps, i++, f.bbWidth);
+        setDouble(ps, i++, f.bbPercentB);
+
+
+        // =====================================================
+        // VOLUME
+        // =====================================================
+
+        setDouble(ps, i++, f.avgVolume5);
+        setDouble(ps, i++, f.avgVolume10);
+        setDouble(ps, i++, f.avgVolume20);
+        setDouble(ps, i++, f.avgVolume50);
+
+        setDouble(ps, i++, f.volumeRatio5);
+        setDouble(ps, i++, f.volumeRatio20);
+        setDouble(ps, i++, f.volumeRatio50);
+
+        setDouble(ps, i++, f.obv);
+
+
+        // =====================================================
+        // HIGHS
+        // =====================================================
+
+        setDouble(ps, i++, f.high5d);
+        setDouble(ps, i++, f.high10d);
+        setDouble(ps, i++, f.high20d);
+        setDouble(ps, i++, f.high50d);
+
+
+        // =====================================================
+        // LOWS
+        // =====================================================
+
+        setDouble(ps, i++, f.low5d);
+        setDouble(ps, i++, f.low10d);
+        setDouble(ps, i++, f.low20d);
+        setDouble(ps, i++, f.low50d);
+
+
+        // =====================================================
+        // DISTANCE FROM HIGH
+        // =====================================================
+
+        setDouble(ps, i++, f.distanceFrom5dHigh);
+
+        setDouble(ps, i++, f.distanceFrom10dHigh);
+
+        setDouble(ps, i++, f.distanceFrom20dHigh);
+
+        setDouble(ps, i++, f.distanceFrom52wHigh);
+
+
+        // =====================================================
+        // PULLBACK / RECOVERY
+        // =====================================================
+
+        setDouble(ps, i++, f.previous5dHigh);
+
+        setDouble(ps, i++, f.previous5dLow);
+
+        setDouble(ps, i++, f.distanceToPrevious5dHigh);
+
+        setDouble(ps, i++, f.pullbackDepth5d);
+
+        setDouble(ps, i++, f.distanceFromPullbackLow);
+
+        if (f.pullbackDays5d == null) {
+
+            ps.setNull(i++, Types.INTEGER);
+
+        } else {
+
+            ps.setInt(i++, f.pullbackDays5d);
+        }
+
+        setDouble(ps, i++, f.recoveryFromPullback);
+
+        setDouble(ps, i++, f.recoveryVolumeRatio);
+
+        setBoolean(ps, i++, f.pullbackDetected);
+
+        setBoolean(ps, i++, f.recoveryDetected);
+
+
+        // =====================================================
+        // RANGE / VOLATILITY
+        // =====================================================
+
+        setDouble(ps, i++, f.dailyRangePercent);
+
+        setDouble(ps, i++, f.avgRange5Percent);
+
+        setDouble(ps, i++, f.avgRange20Percent);
+
+        setDouble(ps, i++, f.volatility5);
+
+        setDouble(ps, i++, f.volatility20);
+
+
+        // =====================================================
+        // PRICE STRUCTURE
+        // =====================================================
+
+        setBoolean(ps, i++, f.higherHigh);
+
+        setBoolean(ps, i++, f.higherLow);
+
+        setBoolean(ps, i++, f.lowerHigh);
+
+        setBoolean(ps, i++, f.lowerLow);
+
+
+        // =====================================================
+        // BREAKOUT
+        // =====================================================
+
+        setBoolean(ps, i++, f.breakout5d);
+
+        setBoolean(ps, i++, f.breakout10d);
+
+        setBoolean(ps, i++, f.breakout20d);
+
+
+        // =====================================================
+        // BREAKDOWN
+        // =====================================================
+
+        setBoolean(ps, i++, f.breakdown5d);
+
+        setBoolean(ps, i++, f.breakdown10d);
+
+        setBoolean(ps, i++, f.breakdown20d);
+
+
+        // =====================================================
+        // CONSOLIDATION
+        // =====================================================
+
+        setDouble(ps, i++, f.consolidationWidth);
+
+        setDouble(ps, i++, f.consolidationScore);
+
+        setDouble(ps, i++, f.breakoutStrength);
+
+
+        // =====================================================
+        // NIFTY
+        // =====================================================
+
+        setDouble(ps, i++, f.niftyReturn5d);
+
+        setDouble(ps, i++, f.niftyReturn10d);
+
+        setDouble(ps, i++, f.niftyReturn20d);
+
+
+        // =====================================================
+        // RELATIVE STRENGTH
+        // =====================================================
+
+        setDouble(ps, i++, f.relativeStrength5d);
+
+        setDouble(ps, i++, f.relativeStrength10d);
+
+        setDouble(ps, i++, f.relativeStrength20d);
+
+
+        // =====================================================
+        // SCORES
+        // =====================================================
+
+        setDouble(ps, i++, f.trendScore);
+
+        setDouble(ps, i++, f.momentumScore);
+
+        setDouble(ps, i++, f.volumeScore);
+
+        setDouble(ps, i++, f.volatilityScore);
+
+        setDouble(ps, i++, f.relativeStrengthScore);
+
+        setDouble(ps, i++, f.priceStructureScore);
+
+        setDouble(ps, i++, f.breakoutScore);
+
+
+        // =====================================================
+        // FINAL SCORE
+        // =====================================================
+
+        setDouble(ps, i++, f.bullishScore);
+
+
+        // =====================================================
+        // MARKET BIAS
+        // =====================================================
+
+        if (f.marketBias == null) {
+
+            ps.setNull(i++, Types.VARCHAR);
+
+        } else {
+
+            ps.setString(i++, f.marketBias);
+        }
+
+        setDouble(ps,i++,f.resistancePrice);
+        setDouble(ps,i++,f.supportPrice);
+        setDouble(ps,i++,f.resistanceStrength);
+        setDouble(ps,i++,f.supportStrength);
+        setDouble(ps,i++,f.distanceToResistance);
+        setDouble(ps,i++,f.distanceToSupport);
+
+
+        // =====================================================
+        // VALIDATE PARAMETER COUNT
+        // =====================================================
+
+        if (i != 121) {
+
+            throw new IllegalStateException("Expected 120 parameters, but assigned " + (i - 1));
         }
     }
 

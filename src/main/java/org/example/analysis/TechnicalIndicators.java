@@ -407,21 +407,32 @@ public class TechnicalIndicators {
             return new double[]{0, 0, 0};
         }
 
+        /*
+         * Single pass: same result as calling calculateEMA() on every prefix
+         * (each EMA is seeded with the SMA of its first `period` closes),
+         * but O(n) instead of O(n^2).
+         */
         List<Double> macdValues = new ArrayList<>();
 
-        for (int i = 0; i < data.size(); i++) {
+        double fastMultiplier = 2.0 / (fastPeriod + 1);
+        double slowMultiplier = 2.0 / (slowPeriod + 1);
 
-            List<StockData> history = data.subList(0, i + 1);
+        double fastEma = calculateSMA(data.subList(0, fastPeriod), fastPeriod);
+        double slowEma = calculateSMA(data.subList(0, slowPeriod), slowPeriod);
 
-            if (history.size() < slowPeriod) {
-                continue;
+        for (int i = fastPeriod; i < data.size(); i++) {
+
+            double close = data.get(i).getClose();
+
+            fastEma = (close - fastEma) * fastMultiplier + fastEma;
+
+            if (i >= slowPeriod) {
+                slowEma = (close - slowEma) * slowMultiplier + slowEma;
             }
 
-            double fast = calculateEMA(history, fastPeriod);
-
-            double slow = calculateEMA(history, slowPeriod);
-
-            macdValues.add(fast - slow);
+            if (i >= slowPeriod - 1) {
+                macdValues.add(fastEma - slowEma);
+            }
         }
 
         if (macdValues.size() < signalPeriod) {

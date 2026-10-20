@@ -1,7 +1,9 @@
 package org.example.analysis;
 
+import org.example.model.CorporateAction;
 import org.example.model.StockData;
 import org.example.model.StockDailyFeature;
+import org.example.repository.CorporateActionRepository;
 import org.example.repository.DB;
 import org.example.repository.StockFeatureRepository;
 import org.example.reader.DataLoader;
@@ -12,152 +14,179 @@ import java.util.*;
 public class StockFeatureCalculator {
 
     private final StockFeatureRepository featureRepository;
+    private final CorporateActionRepository corporateActionRepository;
     private final String niftySymbol;
 
-    public StockFeatureCalculator(StockFeatureRepository featureRepository, String niftySymbol) {
+    public StockFeatureCalculator(StockFeatureRepository featureRepository,
+                                  CorporateActionRepository corporateActionRepository,
+                                  String niftySymbol) {
 
         this.featureRepository = featureRepository;
+        this.corporateActionRepository = corporateActionRepository;
         this.niftySymbol = niftySymbol;
     }
 
     /**
-     * Calculate features for requested date range.
-     * <p>
-     * Example:
-     * <p>
-     * calculate(
-     * LocalDate.of(2026, 8, 10),
-     * LocalDate.of(2026, 8, 10)
-     * );
-     * <p>
-     * The calculator loads historical data for warm-up,
-     * but stores/calculates only the requested dates.
+     * Older candles loaded before the first date being calculated, so that
+     * EMA200, 52-week high, ADX, MACD etc. have enough warm-up history.
+     * EMAs depend on where the series starts; 1000 rows makes that effect
+     * negligible, so a one-day run gives the same values as a full rebuild.
      */
-    public void calculate() throws Exception {
+    private static final int WARMUP_ROWS = 1000;
 
-        /*
-         * Need enough history for:
-         *
-         * EMA200
-         * 52-week high
-         * ADX
-         * RSI
-         * MACD
-         *
-         * 500 trading sessions is safer than 200.
-         */
-        int loadDays = 450;
+    /**
+     * Calculates feature rows for:
+     *
+     * 1. Every (symbol, date) in stock_data from fromDate onward that has
+     *    no row in stock_daily_features yet (backfills missed days).
+     * 2. Each symbol's latest candle, always (picks up same-day corrections,
+     *    e.g. delivery data written later by the loader project).
+     *
+     * Each row is built only from candles up to its own date, so a
+     * backfilled row never sees future data.
+     *
+     * recalculateAll = true also rebuilds rows that already exist from
+     * fromDate onward (use after changing indicator/score logic).
+     *
+     * toDate = null means "up to the latest candle" (and the latest candle of
+     * every symbol is refreshed). A toDate limits the run to fromDate..toDate.
+     *
+     * Splits/bonuses from corporate_actions are applied point-in-time (see
+     * SplitAdjustedSeries). On open-ended runs (toDate = null), any action
+     * not yet applied makes that symbol's rows rebuild from its ex-date
+     * onward; the action is then marked applied.
+     */
+    public void calculate(LocalDate fromDate, LocalDate toDate, boolean recalculateAll) throws Exception {
 
-        System.out.println("Loading " + loadDays + " days of stock data...");
+        System.out.println("Finding missing feature dates from " + fromDate + " to " + (toDate == null ? "latest" : toDate) + "...");
 
-        Map<String, List<StockData>> allData = DataLoader.loadLastNDays(DB.get(), loadDays);
+        Map<String, Set<LocalDate>> missing = featureRepository.findMissingDates(fromDate);
+
+        // Holidays saved as copies of the previous day: never build features for them.
+        Set<LocalDate> duplicateDays = DataLoader.findDuplicateDays(DB.get());
+
+        if (!duplicateDays.isEmpty()) {
+            System.out.println("Skipping " + duplicateDays.size() + " duplicated holiday dates: " + duplicateDays);
+            missing.values().forEach(dates -> dates.removeAll(duplicateDays));
+            missing.values().removeIf(Set::isEmpty);
+        }
+
+        if (toDate != null) {
+            missing.values().forEach(dates -> dates.removeIf(d -> d.isAfter(toDate)));
+            missing.values().removeIf(Set::isEmpty);
+        }
+
+        int missingCount = missing.values().stream().mapToInt(Set::size).sum();
+
+        System.out.println("Missing feature rows: " + missingCount + " across " + missing.size() + " symbols");
+
+        Map<String, List<CorporateAction>> actions = corporateActionRepository.loadAll();
+
+        Map<String, List<CorporateAction>> pending = toDate == null
+            ? corporateActionRepository.loadUnapplied()
+            : Map.of();
+
+        // Per symbol: earliest ex-date whose rows must be rebuilt.
+        Map<String, LocalDate> rebuildFrom = new HashMap<>();
+        pending.forEach((symbol, list) -> rebuildFrom.put(symbol, list.get(0).exDate()));
+
+        LocalDate loadFrom = rebuildFrom.values().stream()
+            .filter(d -> d.isBefore(fromDate))
+            .min(Comparator.naturalOrder())
+            .orElse(fromDate);
+
+        System.out.println("Corporate actions: " + actions.values().stream().mapToInt(List::size).sum()
+            + " total, " + pending.values().stream().mapToInt(List::size).sum() + " new (rebuilding "
+            + rebuildFrom.size() + " symbols from their ex-date)");
+
+        Map<String, List<StockData>> allData = DataLoader.loadSinceWithWarmup(DB.get(), loadFrom, WARMUP_ROWS);
 
         System.out.println("Symbols loaded: " + allData.size());
 
-        /*
-         * NIFTY data.
-         */
-        List<StockData> niftyData = allData.get(niftySymbol);
+        List<StockData> niftyData = allData.containsKey(niftySymbol) ? new ArrayList<>(allData.get(niftySymbol)) : new ArrayList<>();
 
-        if (niftyData == null || niftyData.isEmpty()) {
+        niftyData.removeIf(c -> duplicateDays.contains(c.getDate()));
 
+        if (niftyData.isEmpty()) {
             System.out.println("WARNING: NIFTY data not found: " + niftySymbol);
-
-            niftyData = Collections.emptyList();
         }
 
-        /*
-         * Process every stock.
-         */
+        niftyData.sort(Comparator.comparing(StockData::getDate));
+
+        int written = 0;
+        int symbolsDone = 0;
+
         for (Map.Entry<String, List<StockData>> entry : allData.entrySet()) {
 
             String symbol = entry.getKey();
 
             List<StockData> candles = new ArrayList<>(entry.getValue());
 
+            candles.removeIf(c -> duplicateDays.contains(c.getDate()));
+
             if (candles.isEmpty()) {
                 continue;
             }
 
-            /*
-             * Always sort oldest -> newest.
-             */
+            // Always oldest -> newest.
             candles.sort(Comparator.comparing(StockData::getDate));
 
-            /*
-             * Latest completed daily candle.
-             */
-            StockData latest = candles.get(candles.size() - 1);
+            Set<LocalDate> datesToCalculate = new TreeSet<>(missing.getOrDefault(symbol, Collections.emptySet()));
 
-            LocalDate tradeDate = latest.getDate();
+            // Refresh the latest candle (same-day corrections), but not the
+            // old last row of a stock that stopped trading before fromDate.
+            LocalDate lastDate = candles.get(candles.size() - 1).getDate();
+            if (toDate == null && !lastDate.isBefore(fromDate)) {
+                datesToCalculate.add(lastDate);
+            }
 
-            /*
-             * IMPORTANT:
-             *
-             * Use ALL historical candles up to today
-             * for indicator calculation.
-             *
-             * But create ONLY ONE feature row.
-             */
-            StockDailyFeature feature = buildFeature(symbol, candles, niftyData);
+            SplitAdjustedSeries series = new SplitAdjustedSeries(candles, actions.get(symbol));
 
-            /*
-             * This should insert/update exactly:
-             *
-             * symbol + today's date
-             */
-            featureRepository.upsert(feature);
+            LocalDate rebuildDate = rebuildFrom.get(symbol);
 
-            System.out.println("Updated " + symbol + " -> " + tradeDate);
+            List<StockDailyFeature> batch = new ArrayList<>();
+
+            for (int i = 0; i < candles.size(); i++) {
+
+                LocalDate date = candles.get(i).getDate();
+
+                boolean inRange = !date.isBefore(fromDate) && (toDate == null || !date.isAfter(toDate));
+
+                boolean wanted = recalculateAll
+                    ? inRange
+                    : datesToCalculate.contains(date) || (rebuildDate != null && !date.isBefore(rebuildDate));
+
+                if (!wanted) {
+                    continue;
+                }
+
+                List<StockData> history = series.historyUpTo(i);
+
+                List<StockData> niftyHistory = historyUntil(niftyData, date);
+
+                batch.add(buildFeature(symbol, history, niftyHistory));
+            }
+
+            // One batch + one commit per symbol.
+            featureRepository.upsertBatch(batch);
+
+            written += batch.size();
+
+            symbolsDone++;
+
+            if (batch.size() > 1 || symbolsDone % 250 == 0) {
+                System.out.println("[" + symbolsDone + "/" + allData.size() + "] " + symbol + " -> " + batch.size() + " row(s), total " + written);
+            }
         }
 
-        System.out.println("Daily feature calculation completed.");
+        List<CorporateAction> applied = pending.values().stream().flatMap(List::stream).toList();
+
+        corporateActionRepository.markApplied(applied);
+
+        System.out.println("Daily feature calculation completed. Rows written: " + written
+            + (applied.isEmpty() ? "" : ", corporate actions applied: " + applied.size()));
     }
 
-    private void calculateSymbol(String symbol, List<StockData> candles, List<StockData> niftyData) throws Exception {
-
-        if (candles.isEmpty()) {
-            return;
-        }
-
-        /*
-         * Process each candle independently.
-         *
-         * IMPORTANT:
-         *
-         * We build:
-         *
-         * candles.subList(0, i + 1)
-         *
-         * Therefore today's feature never sees tomorrow's data.
-         */
-        for (int i = 0; i < candles.size(); i++) {
-
-            StockData current = candles.get(i);
-
-            LocalDate date = current.getDate();
-
-            /*
-             * Only write requested dates.
-             */
-
-            /*
-             * Historical data INCLUDING current date.
-             */
-            List<StockData> history = candles.subList(0, i + 1);
-
-            /*
-             * NIFTY history only up to current date.
-             */
-            List<StockData> niftyHistory = historyUntil(niftyData, date);
-
-            StockDailyFeature feature = buildFeature(symbol, history, niftyHistory);
-
-            featureRepository.upsert(feature);
-        }
-
-        System.out.println("Processed: " + symbol);
-    }
     private static class SupportResistance {
 
         double resistancePrice;
@@ -612,6 +641,10 @@ public class StockFeatureCalculator {
 
         StockData current = data.get(data.size() - 1);
 
+        // Number of candles available up to this date. Indicators that need
+        // more history than this are stored as null instead of a fake 0/50.
+        int n = data.size();
+
         StockDailyFeature f = new StockDailyFeature();
 
         f.symbol = symbol;
@@ -651,13 +684,13 @@ public class StockFeatureCalculator {
          * =========================================================
          */
 
-        f.sma20 = TechnicalIndicators.calculateSMA(data, 20);
+        f.sma20 = enough(n, 20, TechnicalIndicators.calculateSMA(data, 20));
 
-        f.sma50 = TechnicalIndicators.calculateSMA(data, 50);
+        f.sma50 = enough(n, 50, TechnicalIndicators.calculateSMA(data, 50));
 
-        f.sma100 = TechnicalIndicators.calculateSMA(data, 100);
+        f.sma100 = enough(n, 100, TechnicalIndicators.calculateSMA(data, 100));
 
-        f.sma200 = TechnicalIndicators.calculateSMA(data, 200);
+        f.sma200 = enough(n, 200, TechnicalIndicators.calculateSMA(data, 200));
 
         /*
          * =========================================================
@@ -665,24 +698,24 @@ public class StockFeatureCalculator {
          * =========================================================
          */
 
-        f.ema9 = TechnicalIndicators.calculateEMA(data, 9);
+        f.ema9 = enough(n, 9, TechnicalIndicators.calculateEMA(data, 9));
 
-        f.ema20 = TechnicalIndicators.calculateEMA(data, 20);
+        f.ema20 = enough(n, 20, TechnicalIndicators.calculateEMA(data, 20));
 
-        f.ema50 = TechnicalIndicators.calculateEMA(data, 50);
+        f.ema50 = enough(n, 50, TechnicalIndicators.calculateEMA(data, 50));
 
-        f.ema100 = TechnicalIndicators.calculateEMA(data, 100);
+        f.ema100 = enough(n, 100, TechnicalIndicators.calculateEMA(data, 100));
 
-        f.ema200 = TechnicalIndicators.calculateEMA(data, 200);
+        f.ema200 = enough(n, 200, TechnicalIndicators.calculateEMA(data, 200));
 
         /*
          * Trend relationships.
          */
-        f.closeAboveEma20 = f.close > f.ema20;
+        f.closeAboveEma20 = f.ema20 == null ? null : f.close > f.ema20;
 
-        f.ema20AboveEma50 = f.ema20 > f.ema50;
+        f.ema20AboveEma50 = greater(f.ema20, f.ema50);
 
-        f.ema50AboveEma200 = f.ema50 > f.ema200;
+        f.ema50AboveEma200 = greater(f.ema50, f.ema200);
 
         /*
          * =========================================================
@@ -690,7 +723,7 @@ public class StockFeatureCalculator {
          * =========================================================
          */
 
-        f.rsi14 = TechnicalIndicators.calculateRSI(data, 14);
+        f.rsi14 = enough(n, 15, TechnicalIndicators.calculateRSI(data, 14));
 
         /*
          * =========================================================
@@ -700,9 +733,10 @@ public class StockFeatureCalculator {
 
         double[] macd = TechnicalIndicators.calculateMACD(data, 12, 26, 9);
 
-        f.macd = macd[0];
-        f.macdSignal = macd[1];
-        f.macdHistogram = macd[2];
+        // MACD needs 26 candles for the slow EMA + 9 for the signal line.
+        f.macd = enough(n, 35, macd[0]);
+        f.macdSignal = enough(n, 35, macd[1]);
+        f.macdHistogram = enough(n, 35, macd[2]);
 
         /*
          * =========================================================
@@ -710,9 +744,9 @@ public class StockFeatureCalculator {
          * =========================================================
          */
 
-        f.atr14 = TechnicalIndicators.calculateATR(data, 14);
+        f.atr14 = enough(n, 15, TechnicalIndicators.calculateATR(data, 14));
 
-        if (f.close > 0) {
+        if (f.atr14 != null && f.close > 0) {
 
             f.atrPercent = (f.atr14 / f.close) * 100.0;
         }
@@ -725,9 +759,10 @@ public class StockFeatureCalculator {
 
         double[] adx = TechnicalIndicators.calculateADX(data, 14);
 
-        f.plusDi14 = adx[0];
-        f.minusDi14 = adx[1];
-        f.adx14 = adx[2];
+        f.plusDi14 = enough(n, 15, adx[0]);
+        f.minusDi14 = enough(n, 15, adx[1]);
+        // ADX averages 14 DX values, each needing 14 candles.
+        f.adx14 = enough(n, 28, adx[2]);
 
         /*
          * =========================================================
@@ -737,9 +772,9 @@ public class StockFeatureCalculator {
 
         double[] stochastic = TechnicalIndicators.calculateStochastic(data, 14, 3);
 
-        f.stochasticK = stochastic[0];
+        f.stochasticK = enough(n, 14, stochastic[0]);
 
-        f.stochasticD = stochastic[1];
+        f.stochasticD = enough(n, 16, stochastic[1]);
 
         /*
          * =========================================================
@@ -747,7 +782,7 @@ public class StockFeatureCalculator {
          * =========================================================
          */
 
-        f.cci20 = TechnicalIndicators.calculateCCI(data, 20);
+        f.cci20 = enough(n, 20, TechnicalIndicators.calculateCCI(data, 20));
 
         /*
          * =========================================================
@@ -755,11 +790,11 @@ public class StockFeatureCalculator {
          * =========================================================
          */
 
-        f.roc5 = TechnicalIndicators.calculateMomentum(data, 5);
+        f.roc5 = enough(n, 6, TechnicalIndicators.calculateMomentum(data, 5));
 
-        f.roc10 = TechnicalIndicators.calculateMomentum(data, 10);
+        f.roc10 = enough(n, 11, TechnicalIndicators.calculateMomentum(data, 10));
 
-        f.roc20 = TechnicalIndicators.calculateMomentum(data, 20);
+        f.roc20 = enough(n, 21, TechnicalIndicators.calculateMomentum(data, 20));
 
         /*
          * =========================================================
@@ -769,16 +804,16 @@ public class StockFeatureCalculator {
 
         double[] bb = TechnicalIndicators.calculateBollingerBands(data, 20, 2.0);
 
-        f.bbLower = bb[0];
-        f.bbMiddle = bb[1];
-        f.bbUpper = bb[2];
+        f.bbLower = enough(n, 20, bb[0]);
+        f.bbMiddle = enough(n, 20, bb[1]);
+        f.bbUpper = enough(n, 20, bb[2]);
 
-        if (f.bbMiddle > 0) {
+        if (f.bbMiddle != null && f.bbMiddle > 0) {
 
             f.bbWidth = ((f.bbUpper - f.bbLower) / f.bbMiddle) * 100.0;
         }
 
-        if (f.bbUpper != f.bbLower) {
+        if (f.bbMiddle != null && !f.bbUpper.equals(f.bbLower)) {
 
             f.bbPercentB = (f.close - f.bbLower) / (f.bbUpper - f.bbLower);
         }
@@ -838,27 +873,27 @@ public class StockFeatureCalculator {
             f.dailyRangePercent = ((f.high - f.low) / f.close) * 100.0;
         }
 
-        f.avgRange5Percent = TechnicalIndicators.calculateAverageRangePercent(data, 5);
+        f.avgRange5Percent = enough(n, 5, TechnicalIndicators.calculateAverageRangePercent(data, 5));
 
-        f.avgRange20Percent = TechnicalIndicators.calculateAverageRangePercent(data, 20);
+        f.avgRange20Percent = enough(n, 20, TechnicalIndicators.calculateAverageRangePercent(data, 20));
 
-        f.volatility5 = TechnicalIndicators.calculateReturnVolatility(data, 5);
+        f.volatility5 = enough(n, 6, TechnicalIndicators.calculateReturnVolatility(data, 5));
 
-        f.volatility20 = TechnicalIndicators.calculateReturnVolatility(data, 20);
-        f.avgVolume5 = TechnicalIndicators.calculateAverageVolume(data, 5);
+        f.volatility20 = enough(n, 21, TechnicalIndicators.calculateReturnVolatility(data, 20));
+        f.avgVolume5 = enough(n, 5, TechnicalIndicators.calculateAverageVolume(data, 5));
 
-        f.avgVolume10 = TechnicalIndicators.calculateAverageVolume(data, 10);
+        f.avgVolume10 = enough(n, 10, TechnicalIndicators.calculateAverageVolume(data, 10));
 
-        f.avgVolume20 = TechnicalIndicators.calculateAverageVolume(data, 20);
+        f.avgVolume20 = enough(n, 20, TechnicalIndicators.calculateAverageVolume(data, 20));
 
-        f.avgVolume50 = TechnicalIndicators.calculateAverageVolume(data, 50);
-        f.volumeRatio5 = f.volume / f.avgVolume5;
+        f.avgVolume50 = enough(n, 50, TechnicalIndicators.calculateAverageVolume(data, 50));
+        // Today's volume vs the average of the previous N days (today
+        // excluded, otherwise a spike dampens its own ratio; max was 5).
+        f.volumeRatio5 = volumeRatio(data, 5);
 
+        f.volumeRatio20 = volumeRatio(data, 20);
 
-        f.volumeRatio20 = f.volume / f.avgVolume20;
-
-
-        f.volumeRatio50 = f.volume / f.avgVolume50;
+        f.volumeRatio50 = volumeRatio(data, 50);
 
         f.obv = TechnicalIndicators.calculateOBV(data);
 
@@ -899,7 +934,8 @@ public class StockFeatureCalculator {
          * =========================================================
          */
 
-        f.consolidationScore = calculateConsolidationScore(data, 20);
+        // consolidationScore is set in calculateBreakout() from the width of
+        // the previous 20-day range (0..100); not overwritten here.
 
         /*
          * =========================================================
@@ -974,19 +1010,19 @@ public class StockFeatureCalculator {
         // TREND SCORE - 20
         // =========================================================
 
-        if (f.closeAboveEma20) {
+        if (Boolean.TRUE.equals(f.closeAboveEma20)) {
             trendScore += 5;
         }
 
-        if (f.ema20AboveEma50) {
+        if (Boolean.TRUE.equals(f.ema20AboveEma50)) {
             trendScore += 5;
         }
 
-        if (f.ema50 > f.ema100) {
+        if (Boolean.TRUE.equals(greater(f.ema50, f.ema100))) {
             trendScore += 5;
         }
 
-        if (f.ema100 > f.ema200) {
+        if (Boolean.TRUE.equals(greater(f.ema100, f.ema200))) {
             trendScore += 5;
         }
 
@@ -1015,7 +1051,7 @@ public class StockFeatureCalculator {
             }
         }
 
-        if (f.macdHistogram > 0) {
+        if (f.macdHistogram != null && f.macdHistogram > 0) {
             momentumScore += 5;
         }
 
@@ -1234,17 +1270,20 @@ public class StockFeatureCalculator {
 
     private void calculateBreakout(List<StockData> data, StockDailyFeature f) {
 
-        f.breakout5d = TechnicalIndicators.isPriceBreakout(data, 5);
+        // Close above the highest high (below the lowest low) of the
+        // previous N days. TechnicalIndicators.isPriceBreakout compares with
+        // the AVERAGE high, which flagged ~20% of stocks daily.
+        f.breakout5d = isBreakout(data, 5);
 
-        f.breakout10d = TechnicalIndicators.isPriceBreakout(data, 10);
+        f.breakout10d = isBreakout(data, 10);
 
-        f.breakout20d = TechnicalIndicators.isPriceBreakout(data, 20);
+        f.breakout20d = isBreakout(data, 20);
 
-        f.breakdown5d = TechnicalIndicators.isPriceBreakdown(data, 5);
+        f.breakdown5d = isBreakdown(data, 5);
 
-        f.breakdown10d = TechnicalIndicators.isPriceBreakdown(data, 10);
+        f.breakdown10d = isBreakdown(data, 10);
 
-        f.breakdown20d = TechnicalIndicators.isPriceBreakdown(data, 20);
+        f.breakdown20d = isBreakdown(data, 20);
 
         /*
          * Use PREVIOUS candles for breakout strength.
@@ -1275,25 +1314,18 @@ public class StockFeatureCalculator {
         }
     }
 
-    private double calculateConsolidationScore(List<StockData> data, int period) {
-
-        if (data.size() < period) {
-            return 0;
-        }
-
-        boolean consolidating = TechnicalIndicators.isConsolidating(data, period, 5.0);
-
-        if (!consolidating) {
-            return 0;
-        }
-
-        return 100;
-    }
-
     private void calculateRelativeStrength(List<StockData> stockData, List<StockData> niftyData, StockDailyFeature f) {
 
         if (niftyData == null || niftyData.isEmpty()) {
+            return;
+        }
 
+        /*
+         * Nifty must have a candle for the same day. Otherwise (index data
+         * stale or missing that day) comparing returns would be wrong, so
+         * leave relative strength as null.
+         */
+        if (!niftyData.get(niftyData.size() - 1).getDate().equals(f.tradeDate)) {
             return;
         }
 
@@ -1303,18 +1335,15 @@ public class StockFeatureCalculator {
 
         f.niftyReturn20d = TechnicalIndicators.calculateReturn(niftyData, 20);
 
-        if (f.return5d != null) {
-
+        if (f.return5d != null && f.niftyReturn5d != null) {
             f.relativeStrength5d = f.return5d - f.niftyReturn5d;
         }
 
-        if (f.return10d != null) {
-
+        if (f.return10d != null && f.niftyReturn10d != null) {
             f.relativeStrength10d = f.return10d - f.niftyReturn10d;
         }
 
-        if (f.return20d != null) {
-
+        if (f.return20d != null && f.niftyReturn20d != null) {
             f.relativeStrength20d = f.return20d - f.niftyReturn20d;
         }
     }
@@ -1336,6 +1365,58 @@ public class StockFeatureCalculator {
         }
 
         return result;
+    }
+
+    private static Double volumeRatio(List<StockData> data, int period) {
+
+        if (data.size() < period + 1) {
+            return null;
+        }
+
+        double sum = 0;
+        for (int i = data.size() - 1 - period; i < data.size() - 1; i++) {
+            sum += data.get(i).getTradedQty();
+        }
+
+        double average = sum / period;
+
+        return average > 0 ? data.get(data.size() - 1).getTradedQty() / average : null;
+    }
+
+    private static Boolean isBreakout(List<StockData> data, int period) {
+
+        if (data.size() < period + 1) {
+            return null;
+        }
+
+        Double previousHigh = TechnicalIndicators.highestHigh(data.subList(0, data.size() - 1), period);
+
+        return data.get(data.size() - 1).getClose() > previousHigh;
+    }
+
+    private static Boolean isBreakdown(List<StockData> data, int period) {
+
+        if (data.size() < period + 1) {
+            return null;
+        }
+
+        Double previousLow = TechnicalIndicators.lowestLow(data.subList(0, data.size() - 1), period);
+
+        return data.get(data.size() - 1).getClose() < previousLow;
+    }
+
+    /** value if at least minCandles of history exist, else null. */
+    private static Double enough(int candles, int minCandles, double value) {
+        return candles >= minCandles ? value : null;
+    }
+
+    /** a > b, or null when either side is unknown. */
+    private static Boolean greater(Double a, Double b) {
+        return a == null || b == null ? null : a > b;
+    }
+
+    private static Double ratio(double value, Double average) {
+        return average == null || average <= 0 ? null : value / average;
     }
 
     private Double percentageFromHigh(double close, Double high) {
